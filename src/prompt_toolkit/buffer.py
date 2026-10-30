@@ -17,7 +17,7 @@ from collections import deque
 from collections.abc import Callable, Coroutine, Iterable
 from enum import Enum
 from functools import wraps
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from .application.current import get_app
 from .application.run_in_terminal import run_in_terminal
@@ -39,6 +39,9 @@ from .search import SearchDirection, SearchState
 from .selection import PasteMode, SelectionState, SelectionType
 from .utils import Event, to_str
 from .validation import ValidationError, Validator
+
+if TYPE_CHECKING:
+    from .input.handoff import HandoffScope
 
 __all__ = [
     "EditReadOnlyBuffer",
@@ -74,6 +77,7 @@ class CompletionState:
         original_document: Document,
         completions: list[Completion] | None = None,
         complete_index: int | None = None,
+        handoff_scope: HandoffScope | None = None,
     ) -> None:
         #: Document as it was when the completion started.
         self.original_document = original_document
@@ -85,6 +89,12 @@ class CompletionState:
         #: Position in the `completions` array.
         #: This can be `None` to indicate "no completion", the original text.
         self.complete_index = complete_index  # Position in the `_completions` array.
+
+        #: Cross-run handoff generation this completion was requested in.
+        #: `None` for runs without an `InputHandoff`. Once the scope is closed
+        #: (the run boundary fired or the document changed), candidates streamed
+        #: for this state must no longer be committed to a later run's UI.
+        self.handoff_scope = handoff_scope
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.original_document!r}, <{len(self.completions)!r}> completions, index={self.complete_index!r})"
@@ -912,14 +922,35 @@ class Buffer:
             self.go_to_completion(None)
             self.complete_state = None
 
-    def _set_completions(self, completions: list[Completion]) -> CompletionState:
+    def discard_completion_state_for_scope(self, scope: HandoffScope) -> None:
+        """
+        Detach completion state that belongs to a now-closed handoff
+        generation.
+
+        Called by `Application` at a cross-run boundary. Buffers keep their
+        text across runs, so without this, a menu streamed by a slow
+        background completer during the run that ended would be rendered again
+        by the next run. State belonging to a still-open outer (nested) run
+        or to runs without a handoff is left untouched.
+        """
+        state = self.complete_state
+        if state is not None and state.handoff_scope is scope:
+            self.complete_state = None
+
+    def _set_completions(
+        self,
+        completions: list[Completion],
+        handoff_scope: HandoffScope | None = None,
+    ) -> CompletionState:
         """
         Start completions. (Generate list of completions and initialize.)
 
         By default, no completion will be selected.
         """
         self.complete_state = CompletionState(
-            original_document=self.document, completions=completions
+            original_document=self.document,
+            completions=completions,
+            handoff_scope=handoff_scope,
         )
 
         # Trigger event. This should eventually invalidate the layout.
@@ -1702,18 +1733,40 @@ class Buffer:
             document = self.document
             complete_event = complete_event or CompleteEvent(text_inserted=True)
 
+            # Generation token of the run that requested this completion.
+            # When the run has no `InputHandoff`, this is `None` and every
+            # generation check below is a no-op (pin behavior).
+            generation_scope = get_app().input_handoff_scope
+
+            # A completion that is (re)scheduled after the run boundary has
+            # already fired must not bring a stale menu into the next run.
+            if generation_scope is not None and generation_scope.closed:
+                return
+
             # Don't complete when we already have completions.
             if self.complete_state or not self.completer:
                 return
 
-            # Create an empty CompletionState.
-            complete_state = CompletionState(original_document=self.document)
+            # Create an empty CompletionState, tagged with the run's handoff
+            # generation so the run boundary can detach it.
+            complete_state = CompletionState(
+                original_document=self.document,
+                handoff_scope=generation_scope,
+            )
             self.complete_state = complete_state
 
             def proceed() -> bool:
                 """Keep retrieving completions. Input text has not yet changed
                 while generating completions."""
                 return self.complete_state == complete_state
+
+            def generation_open() -> bool:
+                """
+                The cross-run boundary that owns this completion has not fired
+                yet. Candidates of a closed generation may never be committed
+                into visible state again.
+                """
+                return generation_scope is None or not generation_scope.closed
 
             refresh_needed = asyncio.Event()
 
@@ -1739,6 +1792,12 @@ class Buffer:
                     self.completer.get_completions_async(document, complete_event)
                 ) as async_generator:
                     async for completion in async_generator:
+                        # The run boundary fired (or a retry landed in a later
+                        # generation): this candidate belongs to a dead
+                        # generation and may never touch visible state.
+                        if not generation_open():
+                            break
+
                         complete_state.completions.append(completion)
                         refresh_needed.set()
 
@@ -1758,6 +1817,12 @@ class Buffer:
                 # Refresh one final time after we got everything.
                 self.on_completions_changed.fire()
 
+            # Boundary closed while the completer was in flight: leave the
+            # (tagged) state alone. The run boundary discards it and no
+            # restart must be scheduled.
+            if not generation_open():
+                return
+
             completions = complete_state.completions
 
             # When there is only one completion, which has nothing to add, ignore it.
@@ -1767,7 +1832,7 @@ class Buffer:
                 del completions[:]
 
             # Set completions if the text was not yet changed.
-            if proceed():
+            if proceed() and generation_open():
                 # When no completions were found, or when the user selected
                 # already a completion by using the arrow keys, don't do anything.
                 if (
@@ -1808,7 +1873,10 @@ class Buffer:
                                 for c in completions
                             ]
 
-                            self._set_completions(completions=completions)
+                            self._set_completions(
+                                completions=completions,
+                                handoff_scope=generation_scope,
+                            )
                         else:
                             self.complete_state = None
                     else:
@@ -1824,6 +1892,12 @@ class Buffer:
             else:
                 # If the last operation was an insert, (not a delete), restart
                 # the completion coroutine.
+
+                # Never restart for a generation whose run boundary fired;
+                # that would smuggle a fresh completion state into the next
+                # run.
+                if not generation_open():
+                    return
 
                 if self.document.text_before_cursor == document.text_before_cursor:
                     return  # Nothing changed.

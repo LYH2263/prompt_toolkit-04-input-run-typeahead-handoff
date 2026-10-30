@@ -45,6 +45,7 @@ from prompt_toolkit.eventloop.utils import call_soon_threadsafe
 from prompt_toolkit.filters import Condition, Filter, FilterOrBool, to_filter
 from prompt_toolkit.formatted_text import AnyFormattedText
 from prompt_toolkit.input.base import Input
+from prompt_toolkit.input.handoff import HandoffScope, InputHandoff
 from prompt_toolkit.input.typeahead import get_typeahead, store_typeahead
 from prompt_toolkit.key_binding.bindings.page_navigation import (
     load_page_navigation_bindings,
@@ -271,6 +272,11 @@ class Application(Generic[_AppResult]):
         self.loop: AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self.context: contextvars.Context | None = None
+
+        # Active cross-run `InputHandoff` scope for the current run (if the
+        # run opted into one). Also the generation token background
+        # completions are bound to.
+        self._input_handoff_scope: HandoffScope | None = None
 
         #: Quoted insert. This flag is set if we go into quoted insert mode.
         self.quoted_insert = False
@@ -619,6 +625,7 @@ class Application(Generic[_AppResult]):
         set_exception_handler: bool = True,
         handle_sigint: bool = True,
         slow_callback_duration: float = 0.5,
+        input_handoff: InputHandoff | None = None,
     ) -> _AppResult:
         """
         Run the prompt_toolkit :class:`~prompt_toolkit.application.Application`
@@ -643,6 +650,13 @@ class Application(Generic[_AppResult]):
             default of `0.1` is sometimes not sufficient on a slow system,
             because exceptionally, the drawing of the app, which happens in the
             event loop, can take a bit longer from time to time.
+        :param input_handoff: Optional
+            :class:`~prompt_toolkit.input.handoff.InputHandoff` bound to this
+            application's `Input`. When given, residual ordinary keys of this
+            run cross the run boundary through the handoff chain (keyed by the
+            `Input` object's identity, nesting aware) instead of the global
+            typeahead store, and background completions are bound to the run's
+            generation. When `None` (the default), behavior is unchanged.
         """
         assert not self._is_running, "Application is already running."
 
@@ -663,13 +677,28 @@ class Application(Generic[_AppResult]):
             # the current timer will be ignored.
             flush_task: asyncio.Task[None] | None = None
 
+            # Cross-run input handoff scope for this run (when opted in).
+            handoff_scope: HandoffScope | None = None
+
             # Reset.
             # (`self.future` needs to be set when `pre_run` is called.)
             self.reset()
             self._pre_run(pre_run)
 
-            # Feed type ahead input first.
-            self.key_processor.feed_multiple(get_typeahead(self.input))
+            # Open the cross-run boundary and feed incoming keys first.
+            # A root scope drains its identity's carry stash; a nested scope
+            # (an inner run borrowing the same `Input`) starts empty. Without
+            # a handoff, this is the legacy global typeahead path.
+            if input_handoff is not None:
+                handoff_scope = input_handoff.begin_run()
+                self._input_handoff_scope = handoff_scope
+                self.key_processor.attach_handoff_scope(handoff_scope)
+                incoming_keys = handoff_scope.take_incoming()
+            else:
+                incoming_keys = get_typeahead(self.input)
+
+            # Feed incoming input first.
+            self.key_processor.feed_multiple(incoming_keys)
             self.key_processor.process_keys()
 
             def read_from_input() -> None:
@@ -777,8 +806,40 @@ class Application(Generic[_AppResult]):
                         if previous_run_in_terminal_f:
                             await previous_run_in_terminal_f
 
-                        # Store unprocessed input as typeahead for next time.
-                        store_typeahead(self.input, self.key_processor.empty_queue())
+                        # Close the cross-run boundary. CPR responses have
+                        # been answered in this run above and are split off at
+                        # the pump, so the residue handed over contains
+                        # ordinary keys only. The boundary then decides whether
+                        # those keys reach the next run on this `Input`
+                        # identity. When the run unwinds due to an exception,
+                        # the scope aborts (publishes nothing). Without a
+                        # handoff, this is the legacy global typeahead path.
+                        if handoff_scope is not None:
+                            # Closing the generation first (commit/abort both
+                            # flip `closed`) stops in-flight background
+                            # completions from re-injecting candidates past the
+                            # boundary; task cancellation follows in the outer
+                            # finally.
+                            residue = (
+                                self.key_processor.drain_handoff_residue()
+                            )
+                            if sys.exc_info()[0] is not None:
+                                handoff_scope.abort()
+                            else:
+                                handoff_scope.commit(residue)
+
+                            # Completion state produced by this run's
+                            # generation must not survive as a ghost menu in a
+                            # later run on the same buffer(s).
+                            self._discard_stale_completion_state(
+                                handoff_scope
+                            )
+                        else:
+                            # Store unprocessed input as typeahead for next
+                            # time.
+                            store_typeahead(
+                                self.input, self.key_processor.empty_queue()
+                            )
 
                 return result
 
@@ -883,11 +944,27 @@ class Application(Generic[_AppResult]):
             try:
                 return await _run_async(f)
             finally:
-                # Wait for the background tasks to be done. This needs to
-                # go in the finally! If `_run_async` raises
-                # `KeyboardInterrupt`, we still want to wait for the
-                # background tasks.
-                await self.cancel_and_wait_for_background_tasks()
+                try:
+                    # Wait for the background tasks to be done. This needs to
+                    # go in the finally! If `_run_async` raises
+                    # `KeyboardInterrupt`, we still want to wait for the
+                    # background tasks.
+                    await self.cancel_and_wait_for_background_tasks()
+                finally:
+                    # Always release this run's handoff boundary, even on a
+                    # cancellation or an early failure before the boundary was
+                    # reached. Aborting an unclosed scope publishes nothing
+                    # and closes the completion generation; popping removes
+                    # it from the identity chain, so a crashed inner run can't
+                    # leave side effects behind for the outer run.
+                    scope = self._input_handoff_scope
+                    self._input_handoff_scope = None
+                    self.key_processor.attach_handoff_scope(None)
+
+                    if scope is not None:
+                        if not scope.closed:
+                            scope.abort()
+                        scope.pop()
 
         # The `ExitStack` above is defined in typeshed in a way that it can
         # swallow exceptions. Without next line, mypy would think that there's
@@ -902,6 +979,7 @@ class Application(Generic[_AppResult]):
         handle_sigint: bool = True,
         in_thread: bool = False,
         inputhook: InputHook | None = None,
+        input_handoff: InputHandoff | None = None,
     ) -> _AppResult:
         """
         A blocking 'run' call that waits until the UI is finished.
@@ -926,6 +1004,10 @@ class Application(Generic[_AppResult]):
             for instance in ptpython.
         :param handle_sigint: Handle SIGINT signal. Call the key binding for
             `Keys.SIGINT`. (This only works in the main thread.)
+        :param input_handoff: Optional
+            :class:`~prompt_toolkit.input.handoff.InputHandoff` for cross-run
+            key carry and completion generation isolation. See
+            :meth:`run_async`.
         """
         if in_thread:
             result: _AppResult
@@ -940,6 +1022,7 @@ class Application(Generic[_AppResult]):
                         # Signal handling only works in the main thread.
                         handle_sigint=False,
                         inputhook=inputhook,
+                        input_handoff=input_handoff,
                     )
                 except BaseException as e:
                     exception = e
@@ -956,6 +1039,7 @@ class Application(Generic[_AppResult]):
             pre_run=pre_run,
             set_exception_handler=set_exception_handler,
             handle_sigint=handle_sigint,
+            input_handoff=input_handoff,
         )
 
         def _called_from_ipython() -> bool:
@@ -1209,6 +1293,22 @@ class Application(Generic[_AppResult]):
                 self._background_tasks, timeout=None, return_when=asyncio.ALL_COMPLETED
             )
 
+    def _discard_stale_completion_state(self, scope: HandoffScope) -> None:
+        """
+        At a cross-run handoff boundary, detach completion state that was
+        produced for the closing run's generation.
+
+        Buffers are deliberately *not* reset between runs (their text and
+        history survive), so a completion menu streamed by a background
+        completer during the run that just ended would otherwise be rendered
+        again by the next run. This only clears state tagged with the scope
+        that is closing; completions belonging to a still-open outer run (or
+        to no handoff at all) are left untouched.
+        """
+        for control in self.layout.find_all_controls():
+            if isinstance(control, BufferControl):
+                control.buffer.discard_completion_state_for_scope(scope)
+
     async def _poll_output_size(self) -> None:
         """
         Coroutine for polling the terminal dimensions.
@@ -1400,6 +1500,15 @@ class Application(Generic[_AppResult]):
     def is_running(self) -> bool:
         "`True` when the application is currently active/running."
         return self._is_running
+
+    @property
+    def input_handoff_scope(self) -> HandoffScope | None:
+        """
+        The active :class:`~prompt_toolkit.input.handoff.HandoffScope` of the
+        current run, or `None` when the run does not opt into cross-run input
+        handoff. Background completion uses this as its generation token.
+        """
+        return self._input_handoff_scope
 
     @property
     def is_done(self) -> bool:

@@ -25,6 +25,7 @@ from .key_bindings import Binding, KeyBindingsBase
 if TYPE_CHECKING:
     from prompt_toolkit.application import Application
     from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.input.handoff import HandoffScope
 
 
 __all__ = [
@@ -98,7 +99,20 @@ class KeyProcessor:
 
         self._flush_wait_task: Task[None] | None = None
 
+        # Active cross-run handoff scope (generation/boundary). ``None`` when
+        # the run does not opt into a handoff; in that case the pump behavior
+        # is identical to the legacy typeahead behavior.
+        self._handoff_scope: HandoffScope | None = None
+
         self.reset()
+
+    def attach_handoff_scope(self, scope: HandoffScope | None) -> None:
+        """
+        Bind (or unbind) the run's handoff scope. While a scope is attached,
+        ending-state ordinary keys belong to that boundary instead of being
+        dumped into the legacy typeahead store.
+        """
+        self._handoff_scope = scope
 
     def reset(self) -> None:
         self._previous_key_sequence: list[KeyPress] = []
@@ -213,15 +227,41 @@ class KeyProcessor:
 
         :param first: If true, insert before everything else.
         """
+        if self._boundary_rejects(key_press):
+            # The run boundary for this pump is already closed. Such an
+            # ordinary key must neither execute a binding nor be stored a
+            # second time. CPR responses and flush markers may still pass, so
+            # that this round can finish answering its cursor requests.
+            return
+
         if first:
             self.input_queue.appendleft(key_press)
         else:
             self.input_queue.append(key_press)
 
+    def _boundary_rejects(self, key_press: KeyPress) -> bool:
+        """
+        True when an attached handoff scope has already closed and this key is
+        an ordinary key (not a CPR response or a flush marker).
+        """
+        scope = self._handoff_scope
+        if scope is None or not scope.closed:
+            return False
+
+        if key_press is _Flush:
+            return False
+
+        return key_press.key != Keys.CPRResponse
+
     def feed_multiple(self, key_presses: list[KeyPress], first: bool = False) -> None:
         """
         :param first: If true, insert before everything else.
         """
+        # Apply the same boundary gate as `feed`. Order is preserved, so a
+        # batch that mixes ordinary keys and a CPR response at the ending
+        # state keeps the CPR while the dead ordinary keys are dropped.
+        key_presses = [k for k in key_presses if not self._boundary_rejects(k)]
+
         if first:
             self.input_queue.extendleft(reversed(key_presses))
         else:
@@ -243,15 +283,20 @@ class KeyProcessor:
             # if ENTER was received, followed by a few additional key strokes,
             # leave the other keys in the queue.)
             if app.is_done:
-                # But if there are still CPRResponse keys in the queue, these
-                # need to be processed.
+                # In the ending state, ordinary keys are boundary residue:
+                # they must not execute a binding anymore. They stay queued
+                # until the run boundary drains them (`empty_queue` for the
+                # legacy typeahead store or `drain_handoff_residue` when an
+                # InputHandoff is active). But if there are still CPRResponse
+                # keys in the queue, these need to be processed *in this run*.
                 return any(k for k in self.input_queue if k.key == Keys.CPRResponse)
             else:
                 return bool(self.input_queue)
 
         def get_next() -> KeyPress:
             if app.is_done:
-                # Only process CPR responses. Everything else is typeahead.
+                # Ending state: only process CPR responses. Everything else is
+                # residue for the cross-run boundary.
                 cpr = [k for k in self.input_queue if k.key == Keys.CPRResponse][0]
                 self.input_queue.remove(cpr)
                 return cpr
@@ -296,6 +341,37 @@ class KeyProcessor:
         # Filter out CPRs. We don't want to return these.
         key_presses = [k for k in key_presses if k.key != Keys.CPRResponse]
         return key_presses
+
+    def drain_handoff_residue(self) -> list[KeyPress]:
+        """
+        Drain every key still queued at a cross-run handoff boundary.
+
+        This is the ending-state pump counterpart of `empty_queue`, used when
+        an `~prompt_toolkit.input.handoff.InputHandoff` scope is active:
+
+        - Every *ordinary* key is returned exactly once and removed from the
+          queue. Ending-state ordinary keys never executed a binding (the
+          done-state loop below only processes CPR responses); they become
+          the boundary residue whose fate the handoff decides.
+        - ``CPRResponse`` keys are consumed here as well but are never
+          returned: a cursor response belongs to the run that requested it
+          and must never reach the next run through the carry stash. This
+          structural split at the pump is what stops CPR responses from
+          leaking through the shutdown drain (they cannot be reintroduced by
+          the handoff either).
+
+        Note this is a separate pump pass from the read callback
+        (`read_from_input`) and from the timeout flush (`auto_flush_input`),
+        neither of which is folded into the boundary.
+        """
+        residue: list[KeyPress] = []
+
+        while self.input_queue:
+            key_press = self.input_queue.popleft()
+            if key_press.key != Keys.CPRResponse:
+                residue.append(key_press)
+
+        return residue
 
     def _call_handler(self, handler: Binding, key_sequence: list[KeyPress]) -> None:
         app = get_app()

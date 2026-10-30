@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .base import DummyInput, Input, PipeInput
 from .defaults import create_input, create_pipe_input
+from .handoff import HandoffScope, InputHandoff
 
 __all__ = [
     # Base.
@@ -11,4 +12,7 @@ __all__ = [
     # Defaults.
     "create_input",
     "create_pipe_input",
+    # Cross-Application keystroke handoff.
+    "InputHandoff",
+    "HandoffScope",
 ]
